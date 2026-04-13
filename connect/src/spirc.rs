@@ -112,6 +112,7 @@ struct SpircTask {
     update_state: bool,
 
     state_sender: broadcast::Sender<PlayerState>,
+    cluster_update_sender: broadcast::Sender<ClusterUpdateInfo>,
 
     spirc_id: usize,
 }
@@ -150,6 +151,20 @@ const UPDATE_STATE_DELAY: Duration = Duration::from_millis(200);
 pub struct Spirc {
     commands: mpsc::UnboundedSender<SpircCommand>,
     state_sender: broadcast::Sender<PlayerState>,
+    cluster_update_sender: broadcast::Sender<ClusterUpdateInfo>,
+}
+
+/// Cluster update info with optional playback fields.
+#[derive(Debug, Clone)]
+pub struct ClusterUpdateInfo {
+    /// Active device id from cluster.
+    pub active_device_id: String,
+    /// Track URI, if present.
+    pub track_uri: Option<String>,
+    /// Effective playing state, if present.
+    pub is_playing: Option<bool>,
+    /// Position in milliseconds, if present.
+    pub position_ms: Option<u32>,
 }
 
 impl Spirc {
@@ -227,6 +242,7 @@ impl Spirc {
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         let (state_tx, _) = broadcast::channel(1);
+        let (cluster_update_tx, _) = broadcast::channel(1);
 
         let player_events = player.get_player_event_channel();
 
@@ -262,6 +278,7 @@ impl Spirc {
             update_state: false,
 
             state_sender: state_tx.clone(),
+            cluster_update_sender: cluster_update_tx.clone(),
 
             spirc_id,
         };
@@ -269,6 +286,7 @@ impl Spirc {
         let spirc = Spirc {
             commands: cmd_tx,
             state_sender: state_tx,
+            cluster_update_sender: cluster_update_tx,
         };
 
         let initial_volume = task.connect_state.device_info().volume;
@@ -429,6 +447,11 @@ impl Spirc {
     /// a spectator, forwards any [PlayerState] update from the active player.
     pub fn get_state_update_channel(&self) -> broadcast::Receiver<PlayerState> {
         self.state_sender.subscribe()
+    }
+
+    /// Returns cluster updates including topology-only updates.
+    pub fn get_cluster_update_channel(&self) -> broadcast::Receiver<ClusterUpdateInfo> {
+        self.cluster_update_sender.subscribe()
     }
 }
 
@@ -947,6 +970,16 @@ impl SpircTask {
         }
     }
 
+    fn emit_cluster_update(&self, update: ClusterUpdateInfo) {
+        if self.cluster_update_sender.receiver_count() == 0 {
+            return;
+        }
+
+        if let Err(why) = self.cluster_update_sender.send(update) {
+            warn!("couldn't emit cluster update because: {why}")
+        }
+    }
+
     async fn handle_cluster_update(
         &mut self,
         mut cluster_update: ClusterUpdate,
@@ -960,6 +993,26 @@ impl SpircTask {
         );
 
         if let Some(mut cluster) = cluster_update.cluster.take() {
+            if !self.connect_state.is_active() {
+                let (track_uri, is_playing, position_ms) =
+                    if let Some(player_state) = cluster.player_state.as_ref() {
+                        (
+                            player_state.track.as_ref().map(|t| t.uri.clone()),
+                            Some(player_state.is_playing && !player_state.is_paused),
+                            Some(player_state.position_as_of_timestamp as u32),
+                        )
+                    } else {
+                        (None, None, None)
+                    };
+
+                self.emit_cluster_update(ClusterUpdateInfo {
+                    active_device_id: cluster.active_device_id.clone(),
+                    track_uri,
+                    is_playing,
+                    position_ms,
+                });
+            }
+
             let became_inactive = self.connect_state.is_active()
                 && cluster.active_device_id != self.session.device_id();
             if became_inactive {
