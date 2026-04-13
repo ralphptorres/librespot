@@ -940,7 +940,8 @@ impl SpircTask {
             return;
         }
 
-        let state = state.unwrap_or_else(|| self.connect_state.player().clone());
+        let mut state = state.unwrap_or_else(|| self.connect_state.player().clone());
+        state.is_playing = state.is_playing && !state.is_paused;
         if let Err(why) = self.state_sender.send(state) {
             warn!("couldn't emit state because: {why}")
         }
